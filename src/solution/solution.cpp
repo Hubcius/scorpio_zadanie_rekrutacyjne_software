@@ -55,20 +55,27 @@ public:
     }
 
     void updatePosition(uint16_t newPosition){
-        previousPosition_ = currentPosition_;
-        currentPosition_ = newPosition;
-        if (std::abs(static_cast<int>(currentPosition_) - static_cast<int>(previousPosition_)) > kEncoderWrapThreshold){
-            goingUpOrDown();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            previousPosition_ = currentPosition_;
+            currentPosition_ = newPosition;
+            if (std::abs(static_cast<int>(currentPosition_) - static_cast<int>(previousPosition_)) > kEncoderWrapThreshold){
+                goingUpOrDown();
+            }
         }
+
         std::cout << static_cast<int>(currentPosition_) << "\n";
         /*
         if(!idle_)
             logFile << static_cast<int>(currentPosition_) << std::endl;
         */
 
+        
+
     }
 
     void speedPIDController(){
+        std::lock_guard<std::mutex> lock(mutex_);
         double motorError{0};
         if(goOverOneCycle_){
             if(directionOfSpeed_ == Direction::Up)
@@ -96,27 +103,42 @@ public:
             output_int += kSmallestMotorValue;
             output_int -= kMotorDeadzone;
         }
-        //std::cout<<"Output "<<output_int<<" "<<kP * motorError<<" "<<kI * integral_<<" "<<kD * derivative<<"\n";
         output_int = std::clamp(output_int, kMotorMinSpeed, kMotorMaxSpeed);
         speed_ = static_cast<int8_t>(output_int);
     }
 
     void motorStop() {
+        std::lock_guard<std::mutex> lock(mutex_);
         speed_ = 0;
         idle_ = true;
     }
 
     void setTargetPosition( uint16_t targetPosition){
+        std::lock_guard<std::mutex> lock(mutex_);
+        integral_ = 0.0;
+        previousMotorError_ = 0.0;
         targetPosition_ = targetPosition;
         idle_ = false;
         goingUpOrDown();
     }
 
-    int8_t getSpeed() const { return speed_; }
-    uint16_t getCurrentPosition() const { return currentPosition_; }
+    int8_t getSpeed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return speed_; 
+    }
+    uint16_t getCurrentPosition() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return currentPosition_; 
+    }
 
-    bool isAtTarget() const { return std::min(std::abs(static_cast<int>(currentPosition_) - static_cast<int>(targetPosition_)), static_cast<int>(kEncoderReadingRange) - std::abs(static_cast<int>(currentPosition_) - static_cast<int>(targetPosition_))) <= kMarginOfMotorTarget; }
-    bool isIdle() const { return idle_;}
+    bool isAtTarget() const { 
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::min(std::abs(static_cast<int>(currentPosition_) - static_cast<int>(targetPosition_)), static_cast<int>(kEncoderReadingRange) - std::abs(static_cast<int>(currentPosition_) - static_cast<int>(targetPosition_))) <= kMarginOfMotorTarget;
+    }
+    bool isIdle() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return idle_;
+    }
 
 private:
     static constexpr uint16_t kEncoderReadingRange{4095};
@@ -136,6 +158,7 @@ private:
     static constexpr double kIntegralLimit{100.0};
     static constexpr double kSmallestMotorValue{58.0};
 
+    mutable std::mutex mutex_;
     uint16_t currentPosition_{0};
     uint16_t previousPosition_{0};
     uint16_t targetPosition_{0};
@@ -200,30 +223,47 @@ int solver(std::shared_ptr<backend_interface::Tester> tester, bool preempt)
     auto motor1Interface = tester->get_motor_1();
     auto motor2Interface = tester->get_motor_2();
     bool motorsAtTarget = false;
-    
-    auto checkAndNotify = [&]() {
-        std::lock_guard<std::mutex> lock(m);
-        if (motor1.isAtTarget() && motor2.isAtTarget()) {
-            motorsAtTarget = true;
-            conditionVariable.notify_one();
-            return true;
-        }
-        return false;
-    };
 
-    commands->add_data_callback([&](const Point &point){
-        std::cout << "Command point: (" << point.x << ", " << point.y << ", " << point.z << ")\n";
+    double kStopDelay{10.1};
+    auto pointInTime{std::chrono::steady_clock::now()};
 
+    auto setTarget = [&](const Point &point) {
         auto [motor1TargetPosition, motor2TargetPosition] = Motor::calculateMotorEndingPosition(point, motor1, motor2);
         motor1.setTargetPosition(motor1TargetPosition);
         motor2.setTargetPosition(motor2TargetPosition);
-        //std::cout<<"IMPORTANT "<<motor1TargetPosition<<" "<<motor2TargetPosition<<"\n";
+        //logFile << motor1TargetPosition <<" "<< motor2TargetPosition << std::endl;
 
         motor1.speedPIDController();
         motor2.speedPIDController();
 
         motor1Interface->send_data(motor1.getSpeed());
         motor2Interface->send_data(motor2.getSpeed());
+    };
+    
+    auto checkAndNotify = [&]() {
+        std::lock_guard<std::mutex> lock(m);
+        if (motor1.isAtTarget() && motor2.isAtTarget()) {
+            auto now{std::chrono::steady_clock::now()};
+            if(std::chrono::duration<double>{now - pointInTime}.count() > kStopDelay){
+                motorsAtTarget = true;
+                conditionVariable.notify_one();
+                return true;
+            }
+            return false;
+        }
+        return false;
+    };
+
+    commands->add_data_callback([&](const Point &point){
+        pointInTime = std::chrono::steady_clock::now();
+        std::cout << "Command point: (" << point.x << ", " << point.y << ", " << point.z << ")\n";
+        if(preempt){
+            setTarget(point); 
+        }
+        else{
+            kStopDelay = 0;
+            setTarget(point); //this else is added, so the task "Dojazd do pojedyńczego celu" is still working perfectly
+        }
     });
 
     motor1Interface->add_data_callback([&](const uint16_t &data){
