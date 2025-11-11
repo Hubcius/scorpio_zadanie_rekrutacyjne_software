@@ -7,9 +7,8 @@
 #include <fstream>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
 
-
-//std::ofstream logFile("/home/hubert/worskspace/pwr/scorpio_zadanie_rekrutacyjne_software/src/solution/motor_log.txt",std::ios::out | std::ios::trunc);
 
 class Motor
 {
@@ -65,13 +64,7 @@ public:
         }
 
         std::cout << static_cast<int>(currentPosition_) << "\n";
-        /*
-        if(!idle_)
-            logFile << static_cast<int>(currentPosition_) << std::endl;
-        */
-
         
-
     }
 
     void speedPIDController(){
@@ -224,14 +217,15 @@ int solver(std::shared_ptr<backend_interface::Tester> tester, bool preempt)
     auto motor2Interface = tester->get_motor_2();
     bool motorsAtTarget = false;
 
-    double kStopDelay{10.1};
+    constexpr double kStopDelay{10.1};
     auto pointInTime{std::chrono::steady_clock::now()};
+    std::queue<Point> targetqueue;
+    std::optional<Point> currentTarget;
 
     auto setTarget = [&](const Point &point) {
         auto [motor1TargetPosition, motor2TargetPosition] = Motor::calculateMotorEndingPosition(point, motor1, motor2);
         motor1.setTargetPosition(motor1TargetPosition);
         motor2.setTargetPosition(motor2TargetPosition);
-        //logFile << motor1TargetPosition <<" "<< motor2TargetPosition << std::endl;
 
         motor1.speedPIDController();
         motor2.speedPIDController();
@@ -243,13 +237,22 @@ int solver(std::shared_ptr<backend_interface::Tester> tester, bool preempt)
     auto checkAndNotify = [&]() {
         std::lock_guard<std::mutex> lock(m);
         if (motor1.isAtTarget() && motor2.isAtTarget()) {
-            auto now{std::chrono::steady_clock::now()};
-            if(std::chrono::duration<double>{now - pointInTime}.count() > kStopDelay){
-                motorsAtTarget = true;
-                conditionVariable.notify_one();
-                return true;
+            if(targetqueue.empty()){
+                auto now{std::chrono::steady_clock::now()};
+                if(std::chrono::duration<double>{now - pointInTime}.count() > kStopDelay){
+                    motorsAtTarget = true;
+                    conditionVariable.notify_one();
+                    return true;
+                }
+                return false;
             }
-            return false;
+            else{
+                currentTarget = targetqueue.front();
+                targetqueue.pop();
+                setTarget(currentTarget.value());
+                return false;
+            }
+
         }
         return false;
     };
@@ -261,8 +264,12 @@ int solver(std::shared_ptr<backend_interface::Tester> tester, bool preempt)
             setTarget(point); 
         }
         else{
-            kStopDelay = 0;
-            setTarget(point); //this else is added, so the task "Dojazd do pojedyńczego celu" is still working perfectly
+            targetqueue.push(point);
+            if(!currentTarget.has_value()){
+                currentTarget = targetqueue.front();
+                targetqueue.pop();
+                setTarget(currentTarget.value());
+            }
         }
     });
 
@@ -300,6 +307,5 @@ int solver(std::shared_ptr<backend_interface::Tester> tester, bool preempt)
     motor1Interface->send_data(motor1.getSpeed());
     motor2Interface->send_data(motor2.getSpeed());
 
-    //logFile.close();
     return 0;
 }
